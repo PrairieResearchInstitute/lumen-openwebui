@@ -8,6 +8,9 @@ code, and produce outputs (similar to Claude's Cowork mode).
 Everything runs in Docker. Your chats and settings stay on your computer. Prompts and
 any file contents the assistant reads are sent to Lumen for processing.
 
+Maintained on a best-effort basis by PRI Data Stewardship and Computing. Questions and
+problems: open an issue on this repo. This is a recipe, not a supported service.
+
 ## What you need
 
 - Docker Desktop (macOS, Windows) or Docker Engine with the compose plugin (Linux)
@@ -24,7 +27,7 @@ curl -s https://lumen.ncsa.illinois.edu/v1/models \
 ## Quick start
 
 ```bash
-git clone <this repo> ~/lumen-openwebui
+git clone https://github.com/PrairieResearchInstitute/lumen-openwebui.git ~/lumen-openwebui
 cd ~/lumen-openwebui
 
 # Put your Lumen key in your shell config (recommended) ...
@@ -161,3 +164,9 @@ Run `docker exec open-terminal id` and adjust ownership of the workspace folder.
 - This setup binds to localhost only and runs in single-user mode (`WEBUI_AUTH=False`).
   For a shared instance, set `WEBUI_AUTH=True` before the first launch and put it
   behind a proper reverse proxy with TLS.
+
+## License
+
+The files in this repo are released under the University of Illinois/NCSA Open Source
+License. See [LICENSE](LICENSE). Open WebUI and Open Terminal are separate projects
+with their own licenses; this repo only configures and runs their published images.
