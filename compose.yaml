@@ -31,11 +31,20 @@ services:
     # No ports published: only Open WebUI can reach it, at http://open-terminal:8000
     environment:
       OPEN_TERMINAL_API_KEY: ${OPEN_TERMINAL_API_KEY:-}
+      # The sidebar file browser opens on the shared folder, not the container's home.
+      OPEN_TERMINAL_FILE_BROWSER_ROOT: "~/owui-workspace"
+      # Added to the model's instructions so it knows where your files are.
+      OPEN_TERMINAL_INFO: "The user's files are in ~/owui-workspace, a folder shared with their computer under the same name. Work there unless asked otherwise. Anything outside it stays inside this container."
+      # Empty: reading an image file gives the model a text error instead of the image.
+      # Needed for text-only models, because Open WebUI passes images to the model
+      # without checking. Set to "image" if every model you use accepts images.
+      OPEN_TERMINAL_BINARY_MIME_PREFIXES: ${TERMINAL_BINARY_MIME_PREFIXES:-}
     volumes:
       # The container's home: installed packages and scratch files persist here.
       - open-terminal-home:/home/user
       # The only folder from your computer the AI can see and change.
-      - ${OWUI_WORKSPACE:-${HOME}/owui-workspace}:/home/user/workspace
+      # Same name inside and outside the container: ~/owui-workspace.
+      - ${OWUI_WORKSPACE:-${HOME}/owui-workspace}:/home/user/owui-workspace
     deploy:
       resources:
         limits:

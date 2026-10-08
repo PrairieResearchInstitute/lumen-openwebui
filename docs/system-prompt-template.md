@@ -42,8 +42,8 @@ on your own.
 
 ## When using the terminal
 
-- My files are in ~/workspace. Don't modify or delete anything there without telling
-  me first what you plan to change.
-- Put new outputs in ~/workspace/outputs unless I say otherwise.
+- My files are in ~/owui-workspace. Don't modify or delete anything there without
+  telling me first what you plan to change.
+- Put new outputs in ~/owui-workspace/outputs unless I say otherwise.
 - Show me the commands you ran when the result matters.
 ```

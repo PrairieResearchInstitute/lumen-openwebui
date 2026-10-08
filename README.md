@@ -58,6 +58,7 @@ echo 'export PATH="$HOME/lumen-openwebui/bin:$PATH"' >> ~/.bashrc
 | `owui logs [service]` | Follow logs (`open-webui` or `open-terminal`) |
 | `owui upgrade` | Pull newer images and restart |
 | `owui terminal-key` | Print the Open Terminal key |
+| `owui connect-terminal` | Register the terminal in Open WebUI (setup does this) |
 | `owui push` / `owui pull` | Move your state to or from another machine (see below) |
 
 Plain `docker compose` commands also work from this folder.
@@ -78,20 +79,32 @@ and common command-line tools. The model can run commands, write files, and show
 the results. A file browser appears in the chat sidebar so you can see, upload, and
 download files.
 
-It is on by default (`COMPOSE_PROFILES=terminal` in `.env`). One-time connection:
+It is on by default (`COMPOSE_PROFILES=terminal` in `.env`), and `owui setup`
+connects it to Open WebUI for you. It shows up as a terminal named **Workspace**.
+If you turned the terminal on later, or the automatic step failed, run:
 
-1. In Open WebUI, open **Admin Panel → Settings → Integrations**.
-2. Scroll to the **Open Terminal** section (not "Tools"). Click **+**.
-3. URL: `http://open-terminal:8000`. Key: the output of `owui terminal-key`.
-   Authentication: Bearer. Save, and check the status turns green.
-4. Enable tool use for the model: **Admin Panel → Settings → Models**, edit the model
-   you use, and turn on native function calling / built-in tools in its capabilities
-   and advanced parameters. Labels vary between Open WebUI versions.
-5. In a new chat, pick the terminal from the dropdown next to the model selector, and
-   try: "List the files in ~/workspace and summarize what's there."
+```bash
+owui connect-terminal
+```
 
-The model sees **only** `~/workspace` inside the container, which is
-`~/owui-workspace` on your computer. Put the files you want it to work on there.
+This uses Open WebUI's admin API, so you don't have to touch the admin settings. It is
+safe to run again. If you turned on login (`WEBUI_AUTH=True`), first create an API key
+under **Settings → Account** and set it as `OWUI_API_KEY` in `.env`.
+
+To use it:
+
+1. Start a new chat and pick a model. Models default to native function calling with
+   built-in tools on, which the terminal needs. If you changed a model's
+   **Function Calling** to Legacy, set it back to Native under **Workspace → Models**.
+2. Click the terminal button (cloud icon) in the chat input and pick **Workspace**
+   under **System**.
+3. Try: "List the files in ~/owui-workspace and summarize what's there."
+
+The folder `~/owui-workspace` on your computer appears under the same name,
+`~/owui-workspace`, inside the container, and the sidebar file browser opens there.
+It is the only part of your computer the model can see. Put the files you want it
+to work on there. If you point `OWUI_WORKSPACE` at a different folder, it still shows
+up as `~/owui-workspace` inside the container.
 
 Things to know:
 
@@ -106,6 +119,11 @@ Things to know:
 - **Results depend on the model's tool use.** Models built for agentic work handle this
   much better than plain chat models. If a model ignores the terminal or loops, try
   another one.
+- **Text-only models can't look at images.** By default the terminal won't send image
+  files to the model, so a model that tries to check its own plot gets a short error
+  and carries on. You still see the image in the file browser. If every model you use
+  accepts images, set `TERMINAL_BINARY_MIME_PREFIXES=image` in `.env` and run
+  `owui up`.
 - To run without the terminal, remove `terminal` from `COMPOSE_PROFILES` and run
   `owui down && owui up`.
 
@@ -147,9 +165,15 @@ localhost:3000. Keep `WEBUI_SECRET_KEY` fixed to prevent it.
 settings into its database on first launch and ignores the environment after that.
 Change it in **Admin Panel → Settings → Connections**.
 
-**Terminal shows "connection failed".** Use `http://open-terminal:8000`, not localhost.
-Check with `docker exec open-webui curl -s http://open-terminal:8000/health`, which
+**Terminal shows "connection failed".** Run `owui connect-terminal` again. It checks the
+connection before saving and prints the error if it fails. If you set it up by hand, use
+`http://open-terminal:8000`, not localhost. Check with `docker exec open-webui curl -s http://open-terminal:8000/health`, which
 should print `{"status": "ok"}`.
+
+**"Model only supports text input; received unsupported content type 'image_url'".**
+The model read an image file and Open WebUI passed the picture to a text-only model.
+Check that `TERMINAL_BINARY_MIME_PREFIXES` is empty in `.env`, run `owui up`, and start
+a new chat. The old chat still holds the image and fails every time it is sent.
 
 **Permission errors in the workspace on Linux.** The terminal runs as a non-root user
 inside the container. If its user id differs from yours, files may be unwritable.

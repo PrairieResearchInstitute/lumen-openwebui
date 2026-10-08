@@ -8,7 +8,8 @@
 #   status            containers, data folder size, database timestamp
 #   logs [service]    follow logs (open-webui or open-terminal)
 #   upgrade           pull newer images and recreate containers
-#   terminal-key      print the Open Terminal API key (to paste into Open WebUI)
+#   terminal-key      print the Open Terminal API key
+#   connect-terminal  register Open Terminal in Open WebUI (setup does this for you)
 #   push [host] [-n] [-w]   move state to another machine (-n dry run, -w include workspace)
 #   pull [host] [-n] [-w]   move state from another machine
 #
@@ -114,9 +115,7 @@ cmd_setup() {
   compose pull
   cmd_up
   if terminal_enabled; then
-    echo
-    info "next: connect the terminal in Open WebUI (see README, 'Open Terminal')"
-    info "      URL: http://open-terminal:8000   key: run 'owui terminal-key'"
+    cmd_connect_terminal || info "could not connect the terminal automatically; run 'owui connect-terminal' to retry"
   fi
 }
 
@@ -157,6 +156,41 @@ cmd_upgrade() {
   info "pulling newer images (upgrade your other machines too before syncing)"
   compose pull
   compose up -d
+}
+
+# Wait until the open-webui container reports healthy (up to ~3 minutes)
+wait_healthy() {
+  local i state
+  for i in $(seq 1 90); do
+    state="$(docker inspect -f '{{if .State.Health}}{{.State.Health.Status}}{{end}}' open-webui 2>/dev/null || true)"
+    [ "$state" = "healthy" ] && return 0
+    [ "$i" = "1" ] && info "waiting for Open WebUI to become healthy"
+    sleep 2
+  done
+  die "open-webui did not become healthy; check 'owui logs open-webui'"
+}
+
+# Register Open Terminal as a system terminal through Open WebUI's admin API.
+# The work happens in lib/connect_terminal.py, run with the container's own python.
+cmd_connect_terminal() {
+  need_docker
+  terminal_enabled || die "Open Terminal is not enabled (add 'terminal' to COMPOSE_PROFILES)"
+  is_running open-terminal || die "open-terminal is not running; run 'owui up'"
+  is_running open-webui    || die "open-webui is not running; run 'owui up'"
+  local key api_key auth
+  key="$(env_get OPEN_TERMINAL_API_KEY)"
+  [ -n "$key" ] || die "no OPEN_TERMINAL_API_KEY set; run 'owui setup'"
+  api_key="$(env_get OWUI_API_KEY)"
+  auth="$(env_get WEBUI_AUTH)"
+  case "$auth" in
+    [Tt]rue|1)
+      [ -n "$api_key" ] || die "login is on (WEBUI_AUTH=True): create an API key under Settings > Account, set OWUI_API_KEY, and rerun" ;;
+  esac
+  wait_healthy
+  # Keys go through stdin so they don't show up in the process list.
+  printf '%s\n%s\n' "$key" "$api_key" |
+    docker exec -i open-webui python3 -c "$(cat "$REPO_DIR/lib/connect_terminal.py")" \
+      "http://open-terminal:8000" "Workspace"
 }
 
 cmd_terminal_key() {
@@ -300,8 +334,9 @@ case "$cmd" in
   logs)         cmd_logs "$@" ;;
   upgrade)      cmd_upgrade ;;
   terminal-key) cmd_terminal_key ;;
+  connect-terminal) cmd_connect_terminal ;;
   push)         cmd_sync push "$@" ;;
   pull)         cmd_sync pull "$@" ;;
-  ""|-h|--help|help) sed -n '2,16p' "$0" | sed 's/^# \{0,1\}//' ;;
+ ""|-h|--help|help) sed -n '2,17p' "$0" | sed 's/^# \{0,1\}//' ;;
   *) die "unknown command '$cmd' (try 'owui help')" ;;
 esac
