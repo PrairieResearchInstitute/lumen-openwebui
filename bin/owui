@@ -9,7 +9,10 @@
 #   logs [service]    follow logs (open-webui or open-terminal)
 #   upgrade           pull newer images and recreate containers
 #   terminal-key      print the Open Terminal API key
-#   connect-terminal  register Open Terminal in Open WebUI (setup does this for you)
+#   connect-terminal  register the terminals in Open WebUI (setup does this for you)
+#   project add NAME PATH   a separate terminal that sees only PATH (under your home folder)
+#   project rm NAME         remove that terminal (the folder itself is not touched)
+#   project list            list project terminals
 #   push [host] [-n] [-w]   move state to another machine (-n dry run, -w include workspace)
 #   pull [host] [-n] [-w]   move state from another machine
 #
@@ -21,6 +24,9 @@ set -euo pipefail
 REPO_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 ENV_FILE="$REPO_DIR/.env"
 CONTAINERS="open-webui open-terminal"
+PROJECTS_FILE="$REPO_DIR/projects.conf"          # NAME<tab>PATH, one per line (gitignored)
+OVERRIDE_FILE="$REPO_DIR/compose.override.yaml"  # generated from PROJECTS_FILE (gitignored)
+TAB="$(printf '\t')"
 # Non-interactive ssh sessions on macOS often lack Docker's location in PATH.
 REMOTE_ENV='PATH="/usr/local/bin:/opt/homebrew/bin:$HOME/.docker/bin:$PATH"'
 
@@ -170,27 +176,193 @@ wait_healthy() {
   die "open-webui did not become healthy; check 'owui logs open-webui'"
 }
 
-# Register Open Terminal as a system terminal through Open WebUI's admin API.
-# The work happens in lib/connect_terminal.py, run with the container's own python.
-cmd_connect_terminal() {
+# Check we can talk to Open WebUI's admin API; sets CONNECT_KEY and CONNECT_API_KEY.
+connect_prepare() {
   need_docker
   terminal_enabled || die "Open Terminal is not enabled (add 'terminal' to COMPOSE_PROFILES)"
-  is_running open-terminal || die "open-terminal is not running; run 'owui up'"
-  is_running open-webui    || die "open-webui is not running; run 'owui up'"
-  local key api_key auth
-  key="$(env_get OPEN_TERMINAL_API_KEY)"
-  [ -n "$key" ] || die "no OPEN_TERMINAL_API_KEY set; run 'owui setup'"
-  api_key="$(env_get OWUI_API_KEY)"
-  auth="$(env_get WEBUI_AUTH)"
-  case "$auth" in
+  is_running open-webui || die "open-webui is not running; run 'owui up'"
+  CONNECT_KEY="$(env_get OPEN_TERMINAL_API_KEY)"
+  [ -n "$CONNECT_KEY" ] || die "no OPEN_TERMINAL_API_KEY set; run 'owui setup'"
+  CONNECT_API_KEY="$(env_get OWUI_API_KEY)"
+  case "$(env_get WEBUI_AUTH)" in
     [Tt]rue|1)
-      [ -n "$api_key" ] || die "login is on (WEBUI_AUTH=True): create an API key under Settings > Account, set OWUI_API_KEY, and rerun" ;;
+      [ -n "$CONNECT_API_KEY" ] || die "login is on (WEBUI_AUTH=True): create an API key under Settings > Account, set OWUI_API_KEY, and rerun" ;;
   esac
   wait_healthy
-  # Keys go through stdin so they don't show up in the process list.
-  printf '%s\n%s\n' "$key" "$api_key" |
-    docker exec -i open-webui python3 -c "$(cat "$REPO_DIR/lib/connect_terminal.py")" \
-      "http://open-terminal:8000" "Workspace"
+}
+
+# connect_call URL NAME [remove]: add/update (or remove) one terminal connection.
+# The work happens in lib/connect_terminal.py, run with the container's own python.
+# Keys go through stdin so they don't show up in the process list.
+connect_call() {
+  printf '%s\n%s\n' "$CONNECT_KEY" "$CONNECT_API_KEY" |
+    docker exec -i open-webui python3 -c "$(cat "$REPO_DIR/lib/connect_terminal.py")" "$@"
+}
+
+# Wait until Open WebUI can reach a terminal service (up to ~60 s)
+wait_terminal() {
+  local svc="$1" i
+  for i in $(seq 1 30); do
+    docker exec open-webui curl -sf "http://$svc:8000/health" >/dev/null 2>&1 && return 0
+    sleep 2
+  done
+  die "Open WebUI cannot reach $svc; check 'owui logs $svc'"
+}
+
+# Register the main terminal and every project terminal. Safe to run again.
+cmd_connect_terminal() {
+  connect_prepare
+  is_running open-terminal || die "open-terminal is not running; run 'owui up'"
+  wait_terminal open-terminal
+  connect_call "http://open-terminal:8000" "Workspace"
+  local name path slug
+  if [ -s "$PROJECTS_FILE" ]; then
+    while IFS="$TAB" read -r name path; do
+      [ -n "$name" ] || continue
+      slug="$(project_slug "$name")"
+      wait_terminal "terminal-$slug"
+      connect_call "http://terminal-$slug:8000" "$name"
+    done < "$PROJECTS_FILE"
+  fi
+}
+
+# ---------- project terminals ----------
+
+project_slug() { printf '%s' "$1" | tr 'A-Z_' 'a-z-'; }
+
+# Path of project NAME, empty if there is none
+project_path() {
+  [ -f "$PROJECTS_FILE" ] || return 0
+  awk -F'\t' -v n="$1" '$1 == n { print $2; exit }' "$PROJECTS_FILE"
+}
+
+# Write compose.override.yaml from projects.conf. Docker Compose reads that file
+# automatically, so plain `docker compose` commands see the project terminals too.
+write_override() {
+  if [ ! -s "$PROJECTS_FILE" ]; then
+    rm -f "$OVERRIDE_FILE"
+    return 0
+  fi
+  local tmp name path slug rel
+  tmp="$(mktemp)"
+  {
+    echo "# Generated by 'owui project' from projects.conf. Do not edit: it is rewritten."
+    echo "# One Open Terminal per project. Each sees only its own folder from your computer,"
+    echo "# at the same path under the home folder as on your computer."
+    echo "services:"
+    while IFS="$TAB" read -r name path; do
+      [ -n "$name" ] || continue
+      slug="$(project_slug "$name")"
+      rel="${path#"$HOME"/}"
+      cat <<EOF
+  terminal-$slug:
+    image: ghcr.io/open-webui/open-terminal:\${TERMINAL_TAG:-latest}
+    container_name: open-terminal-$slug
+    profiles: ["terminal"]
+    restart: unless-stopped
+    environment:
+      OPEN_TERMINAL_API_KEY: \${OPEN_TERMINAL_API_KEY:-}
+      OPEN_TERMINAL_FILE_BROWSER_ROOT: "~/$rel"
+      OPEN_TERMINAL_INFO: "Project $name. The user's files are in ~/$rel, shared with their computer at the same path under their home folder. It is the only folder from their computer available here. Work there unless asked otherwise."
+      OPEN_TERMINAL_BINARY_MIME_PREFIXES: \${TERMINAL_BINARY_MIME_PREFIXES:-}
+    volumes:
+      - terminal-$slug-home:/home/user
+      - "$path:/home/user/$rel"
+    deploy:
+      resources:
+        limits:
+          memory: \${TERMINAL_MEMORY:-4G}
+          cpus: "\${TERMINAL_CPUS:-2.0}"
+EOF
+    done < "$PROJECTS_FILE"
+    echo "volumes:"
+    while IFS="$TAB" read -r name path; do
+      [ -n "$name" ] || continue
+      echo "  terminal-$(project_slug "$name")-home:"
+    done < "$PROJECTS_FILE"
+  } > "$tmp"
+  mv "$tmp" "$OVERRIDE_FILE"
+}
+
+project_add() {
+  [ $# -eq 2 ] || die "usage: owui project add NAME PATH"
+  local name="$1" path="$2" slug n p
+  case "$name" in
+    ""|-*|*[!A-Za-z0-9_-]*) die "project name: letters, digits, - and _ only (got '$name')" ;;
+  esac
+  slug="$(project_slug "$name")"
+  [ -z "$(project_path "$name")" ] || die "project '$name' already exists"
+  if [ -s "$PROJECTS_FILE" ]; then
+    while IFS="$TAB" read -r n p; do
+      [ "$(project_slug "$n")" != "$slug" ] || die "'$name' clashes with existing project '$n'"
+    done < "$PROJECTS_FILE"
+  fi
+  case "$path" in
+    *[\"\\:\$]*|*"$TAB"*) die "the folder path may not contain quotes, backslashes, colons, \$ or tabs" ;;
+  esac
+
+  connect_prepare
+  mkdir -p "$path"
+  path="$(cd "$path" && pwd)"
+  case "$path" in
+    "$HOME"/*) ;;
+    *) die "$path is not inside your home folder" ;;
+  esac
+
+  printf '%s\t%s\n' "$name" "$path" >> "$PROJECTS_FILE"
+  write_override
+  info "starting terminal-$slug (sees only $path)"
+  compose up -d "terminal-$slug"
+  wait_terminal "terminal-$slug"
+  connect_call "http://terminal-$slug:8000" "$name"
+  info "in a chat, pick '$name' from the terminal button to use it"
+}
+
+project_rm() {
+  [ $# -eq 1 ] || die "usage: owui project rm NAME"
+  local name="$1" path slug tmp
+  path="$(project_path "$name")"
+  [ -n "$path" ] || die "no project named '$name' (see 'owui project list')"
+  slug="$(project_slug "$name")"
+  need_docker
+  if is_running open-webui; then
+    connect_prepare
+    connect_call "http://terminal-$slug:8000" "$name" remove
+  else
+    info "open-webui is not running; remove the '$name' terminal in its settings later"
+  fi
+  compose rm -s -f "terminal-$slug" >/dev/null 2>&1 || true
+  tmp="$(mktemp)"
+  awk -F'\t' -v n="$name" '$1 != n' "$PROJECTS_FILE" > "$tmp"
+  mv "$tmp" "$PROJECTS_FILE"
+  write_override
+  info "removed project '$name'. Your folder $path was not touched."
+  info "its installed packages are kept in a volume; to delete them:"
+  info "  docker volume rm lumen-openwebui_terminal-$slug-home"
+}
+
+project_list() {
+  if [ ! -s "$PROJECTS_FILE" ]; then
+    info "no projects (add one with: owui project add NAME PATH)"
+    return 0
+  fi
+  local name path state
+  while IFS="$TAB" read -r name path; do
+    [ -n "$name" ] || continue
+    if is_running "open-terminal-$(project_slug "$name")"; then state="running"; else state="stopped"; fi
+    printf '%-20s %-8s %s\n' "$name" "$state" "$path"
+  done < "$PROJECTS_FILE"
+}
+
+cmd_project() {
+  local sub="${1:-list}"
+  [ $# -gt 0 ] && shift
+  case "$sub" in
+    add)       project_add "$@" ;;
+    rm|remove) project_rm "$@" ;;
+    list|ls)   project_list ;;
+    *) die "unknown project command '$sub' (add, rm, list)" ;;
+  esac
 }
 
 cmd_terminal_key() {
@@ -335,8 +507,9 @@ case "$cmd" in
   upgrade)      cmd_upgrade ;;
   terminal-key) cmd_terminal_key ;;
   connect-terminal) cmd_connect_terminal ;;
+  project)      cmd_project "$@" ;;
   push)         cmd_sync push "$@" ;;
   pull)         cmd_sync pull "$@" ;;
- ""|-h|--help|help) sed -n '2,17p' "$0" | sed 's/^# \{0,1\}//' ;;
+  ""|-h|--help|help) sed -n '2,20p' "$0" | sed 's/^# \{0,1\}//' ;;
   *) die "unknown command '$cmd' (try 'owui help')" ;;
 esac

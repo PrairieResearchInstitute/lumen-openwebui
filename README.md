@@ -58,7 +58,8 @@ echo 'export PATH="$HOME/lumen-openwebui/bin:$PATH"' >> ~/.bashrc
 | `owui logs [service]` | Follow logs (`open-webui` or `open-terminal`) |
 | `owui upgrade` | Pull newer images and restart |
 | `owui terminal-key` | Print the Open Terminal key |
-| `owui connect-terminal` | Register the terminal in Open WebUI (setup does this) |
+| `owui connect-terminal` | Register the terminals in Open WebUI (setup does this) |
+| `owui project add/rm/list` | Separate terminals for separate projects (see below) |
 | `owui push` / `owui pull` | Move your state to or from another machine (see below) |
 
 Plain `docker compose` commands also work from this folder.
@@ -126,6 +127,37 @@ Things to know:
   `owui up`.
 - To run without the terminal, remove `terminal` from `COMPOSE_PROFILES` and run
   `owui down && owui up`.
+
+## Separate terminals for separate projects
+
+The **Workspace** terminal sees all of `~/owui-workspace`. To keep a project's files
+apart, give it its own terminal that sees only its folder:
+
+```bash
+owui project add Report ~/owui-workspace/Report
+```
+
+This starts another Open Terminal container that mounts only that folder, at the
+same path under the home folder (`~/owui-workspace/Report` in both places), and
+registers it in Open WebUI as **Report**. In a chat, pick **Report** from the
+terminal button instead of **Workspace**. The folder can be anywhere under your
+home folder and is created if it does not exist.
+
+```bash
+owui project list          # projects and whether their terminals are running
+owui project rm Report     # remove the terminal; the folder is not touched
+```
+
+Each project terminal has its own installed packages and its own memory limit
+(`TERMINAL_MEMORY`, 4G by default), so keep the number reasonable. Projects are
+stored in `projects.conf` and `compose.override.yaml` in this folder. Both are
+specific to your computer and not committed. `owui up`, `down`, and `status` include
+the project terminals automatically.
+
+A lighter option, if you only want to keep work organized: create a chat folder in
+Open WebUI, and in the folder's settings set a system prompt such as "Work only in
+~/owui-workspace/Report." Every chat in that folder gets it. The model is asked to stay
+in that folder but is not prevented from leaving it.
 
 ## Personalizing the assistant
 

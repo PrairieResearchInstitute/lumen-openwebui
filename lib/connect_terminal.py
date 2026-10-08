@@ -1,6 +1,8 @@
-# Register Open Terminal as a system terminal in Open WebUI, through its admin API.
-# Runs INSIDE the open-webui container (python3 is there; nothing needed on the host).
-# Called by `owui connect-terminal`. Reads from stdin, one per line:
+# Register (or remove) an Open Terminal as a system terminal in Open WebUI, through
+# its admin API. Runs INSIDE the open-webui container (python3 is there; nothing is
+# needed on the host). Called by bin/owui.
+#   usage: python3 connect_terminal.py URL NAME [remove]
+# Reads from stdin, one per line:
 #   1. the Open Terminal API key
 #   2. an Open WebUI API key (empty in single-user mode)
 # Safe to run again: it updates the existing connection instead of adding a second one.
@@ -13,10 +15,11 @@ import uuid
 BASE = "http://localhost:8080"
 TERM_URL = sys.argv[1] if len(sys.argv) > 1 else "http://open-terminal:8000"
 TERM_NAME = sys.argv[2] if len(sys.argv) > 2 else "Workspace"
+REMOVE = len(sys.argv) > 3 and sys.argv[3] == "remove"
 
 lines = sys.stdin.read().splitlines() + ["", ""]
 ot_key, api_key = lines[0].strip(), lines[1].strip()
-if not ot_key:
+if not ot_key and not REMOVE:
     sys.exit("owui: no Open Terminal key given")
 
 
@@ -47,6 +50,23 @@ else:
     if not token:
         sys.exit("owui: sign-in returned no token")
 
+def same_url(c):
+    return (c.get("url") or "").rstrip("/") == TERM_URL.rstrip("/")
+
+
+# Removing: drop the connection with this URL and stop.
+if REMOVE:
+    current = call("GET", "/api/v1/configs/terminal_servers", token) or {}
+    conns = current.get("TERMINAL_SERVER_CONNECTIONS") or []
+    kept = [c for c in conns if not same_url(c)]
+    if len(kept) == len(conns):
+        print("owui: no terminal connection for %s, nothing to remove" % TERM_URL)
+    else:
+        call("POST", "/api/v1/configs/terminal_servers", token,
+             {"TERMINAL_SERVER_CONNECTIONS": kept})
+        print("owui: terminal connection removed: '%s' (%s)" % (TERM_NAME, TERM_URL))
+    sys.exit(0)
+
 # 2. Check that Open WebUI can reach the terminal with this key.
 check = call("POST", "/api/v1/configs/terminal_servers/verify", token,
              {"url": TERM_URL, "key": ot_key, "auth_type": "bearer"}) or {}
@@ -72,7 +92,7 @@ entry = {
 
 action = "added"
 for i, c in enumerate(conns):
-    if (c.get("url") or "").rstrip("/") == TERM_URL.rstrip("/"):
+    if same_url(c):
         merged = dict(c)
         merged.update(entry)
         merged["id"] = c.get("id") or str(uuid.uuid4())
