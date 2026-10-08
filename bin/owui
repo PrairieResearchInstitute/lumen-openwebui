@@ -1,0 +1,307 @@
+#!/bin/bash
+# owui: manage a local Open WebUI (+ optional Open Terminal) stack connected to NCSA Lumen.
+#
+# Usage: owui <command> [options]
+#   setup             create .env, generate keys, create folders, pull images, start
+#   up | down         start the stack / stop and remove containers (data is kept)
+#   start | stop      start or stop existing containers
+#   status            containers, data folder size, database timestamp
+#   logs [service]    follow logs (open-webui or open-terminal)
+#   upgrade           pull newer images and recreate containers
+#   terminal-key      print the Open Terminal API key (to paste into Open WebUI)
+#   push [host] [-n] [-w]   move state to another machine (-n dry run, -w include workspace)
+#   pull [host] [-n] [-w]   move state from another machine
+#
+# Settings: shell environment first, then .env in the repo folder.
+# Compatible with macOS bash 3.2 and Linux.
+
+set -euo pipefail
+
+REPO_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+ENV_FILE="$REPO_DIR/.env"
+CONTAINERS="open-webui open-terminal"
+# Non-interactive ssh sessions on macOS often lack Docker's location in PATH.
+REMOTE_ENV='PATH="/usr/local/bin:/opt/homebrew/bin:$HOME/.docker/bin:$PATH"'
+
+die()  { echo "owui: $*" >&2; exit 1; }
+info() { echo "owui: $*"; }
+
+# ---------- settings ----------
+
+# Value of KEY from the shell environment, else from .env
+env_get() {
+  local key="$1" val=""
+  val="$(printenv "$key" 2>/dev/null || true)"
+  if [ -z "$val" ] && [ -f "$ENV_FILE" ]; then
+    val="$(grep -E "^${key}=" "$ENV_FILE" | tail -n 1 | cut -d= -f2- || true)"
+    val="${val%\"}"; val="${val#\"}"
+  fi
+  printf '%s' "$val"
+}
+
+# Set KEY=VALUE in .env, replacing an existing line if present
+env_set() {
+  local key="$1" val="$2" tmp
+  tmp="$(mktemp)"
+  if grep -qE "^${key}=" "$ENV_FILE"; then
+    awk -v k="$key" -v v="$val" 'index($0, k"=") == 1 { print k"="v; next } { print }' "$ENV_FILE" > "$tmp"
+  else
+    cat "$ENV_FILE" > "$tmp"
+    echo "${key}=${val}" >> "$tmp"
+  fi
+  mv "$tmp" "$ENV_FILE"
+  chmod 600 "$ENV_FILE"
+}
+
+data_dir()      { local d; d="$(env_get OWUI_DATA)";      echo "${d:-$HOME/openwebui-data}"; }
+workspace_dir() { local d; d="$(env_get OWUI_WORKSPACE)"; echo "${d:-$HOME/owui-workspace}"; }
+port()          { local p; p="$(env_get OWUI_PORT)";      echo "${p:-3000}"; }
+
+terminal_enabled() {
+  case ",$(env_get COMPOSE_PROFILES)," in *,terminal,*) return 0 ;; esac
+  return 1
+}
+
+# ---------- docker helpers ----------
+
+need_docker() { docker info >/dev/null 2>&1 || die "Docker is not running on this machine"; }
+
+compose() { (cd "$REPO_DIR" && docker compose "$@"); }
+
+is_running() {
+  [ "$(docker inspect -f '{{.State.Running}}' "$1" 2>/dev/null || true)" = "true" ]
+}
+
+# Remove an old container with our name that compose does not manage
+# (for example the one started earlier with plain `docker run`).
+remove_legacy() {
+  local c label
+  for c in $CONTAINERS; do
+    docker inspect "$c" >/dev/null 2>&1 || continue
+    label="$(docker inspect -f '{{index .Config.Labels "com.docker.compose.project"}}' "$c" 2>/dev/null || true)"
+    if [ "$label" != "lumen-openwebui" ]; then
+      info "removing old standalone container '$c' (your data folder is not touched)"
+      docker rm -f "$c" >/dev/null
+    fi
+  done
+}
+
+# ---------- commands ----------
+
+cmd_setup() {
+  need_docker
+  if [ ! -f "$ENV_FILE" ]; then
+    cp "$REPO_DIR/.env.example" "$ENV_FILE"
+    chmod 600 "$ENV_FILE"
+    info "created .env from .env.example"
+  fi
+  [ -n "$(env_get LUMEN_API_KEY)" ] || die "set LUMEN_API_KEY in your shell or in $ENV_FILE, then run setup again"
+
+  if [ -z "$(env_get WEBUI_SECRET_KEY)" ]; then
+    env_set WEBUI_SECRET_KEY "$(openssl rand -hex 32)"
+    info "generated WEBUI_SECRET_KEY in .env"
+  fi
+  if terminal_enabled && [ -z "$(env_get OPEN_TERMINAL_API_KEY)" ]; then
+    env_set OPEN_TERMINAL_API_KEY "$(openssl rand -hex 24)"
+    info "generated OPEN_TERMINAL_API_KEY in .env"
+  fi
+
+  mkdir -p "$(data_dir)"
+  terminal_enabled && mkdir -p "$(workspace_dir)"
+
+  remove_legacy
+  info "pulling images"
+  compose pull
+  cmd_up
+  if terminal_enabled; then
+    echo
+    info "next: connect the terminal in Open WebUI (see README, 'Open Terminal')"
+    info "      URL: http://open-terminal:8000   key: run 'owui terminal-key'"
+  fi
+}
+
+cmd_up() {
+  need_docker
+  mkdir -p "$(data_dir)"
+  terminal_enabled && mkdir -p "$(workspace_dir)"
+  compose up -d
+  info "Open http://localhost:$(port) once 'owui status' shows (healthy)"
+}
+
+cmd_down()  { need_docker; compose down;  info "stopped and removed containers; data kept in $(data_dir)"; }
+cmd_start() { need_docker; compose start; }
+cmd_stop()  { need_docker; compose stop;  }
+
+cmd_status() {
+  need_docker
+  compose ps
+  local d; d="$(data_dir)"
+  echo
+  if [ -d "$d" ]; then
+    echo "data:      $d ($(du -sh "$d" 2>/dev/null | cut -f1))"
+    echo "database:  last modified $(fmt_time "$(db_mtime_local)")"
+  else
+    echo "data:      $d does not exist yet"
+  fi
+  if terminal_enabled; then
+    echo "workspace: $(workspace_dir)"
+  else
+    echo "terminal:  disabled (add 'terminal' to COMPOSE_PROFILES to enable)"
+  fi
+}
+
+cmd_logs() { need_docker; compose logs -f --tail 100 "$@"; }
+
+cmd_upgrade() {
+  need_docker
+  info "pulling newer images (upgrade your other machines too before syncing)"
+  compose pull
+  compose up -d
+}
+
+cmd_terminal_key() {
+  local k; k="$(env_get OPEN_TERMINAL_API_KEY)"
+  [ -n "$k" ] || die "no OPEN_TERMINAL_API_KEY set; run 'owui setup' with the terminal enabled"
+  echo "$k"
+}
+
+# ---------- sync between machines ----------
+
+db_mtime_local() {
+  local f; f="$(data_dir)/webui.db"
+  [ -e "$f" ] || { echo 0; return; }
+  stat -c %Y "$f" 2>/dev/null || stat -f %m "$f"
+}
+
+db_mtime_remote() {
+  ssh "$1" "f=$2/webui.db; [ -e \"\$f\" ] || { echo 0; exit; }; stat -c %Y \"\$f\" 2>/dev/null || stat -f %m \"\$f\""
+}
+
+fmt_time() {
+  [ "$1" = "0" ] && { echo "(none)"; return; }
+  date -r "$1" '+%Y-%m-%d %H:%M:%S' 2>/dev/null || date -d "@$1" '+%Y-%m-%d %H:%M:%S'
+}
+
+# Path relative to $HOME, so the same layout is used on the other machine
+home_rel() {
+  local p="$1"
+  case "$p" in
+    "$HOME"/*) echo "${p#"$HOME"/}" ;;
+    *) die "$p is not under your home folder; push/pull needs paths under \$HOME" ;;
+  esac
+}
+
+stop_local() {
+  local c
+  for c in $CONTAINERS; do
+    if is_running "$c"; then info "stopping local $c"; docker stop "$c" >/dev/null; fi
+  done
+  is_running open-webui && die "local open-webui is still running; not syncing"
+  return 0
+}
+
+stop_remote() {
+  local host="$1" state
+  ssh "$host" true 2>/dev/null || die "cannot ssh to $host"
+  info "stopping containers on $host"
+  ssh "$host" "$REMOTE_ENV; docker stop $CONTAINERS >/dev/null 2>&1; true"
+  state="$(ssh "$host" "$REMOTE_ENV; docker inspect -f '{{.State.Running}}' open-webui 2>/dev/null || true")"
+  [ "$state" = "true" ] && die "open-webui on $host is still running; not syncing"
+  return 0
+}
+
+confirm() {
+  local answer
+  printf '%s [y/N] ' "$1"
+  read -r answer
+  case "$answer" in y|Y|yes|YES) return 0 ;; *) return 1 ;; esac
+}
+
+# sync <push|pull> [host] [-n] [-w]
+cmd_sync() {
+  local dir="$1"; shift
+  local host="" dry="" with_ws="" arg
+  for arg in "$@"; do
+    case "$arg" in
+      -n|--dry-run)   dry="-n" ;;
+      -w|--workspace) with_ws="yes" ;;
+      -*) die "unknown option $arg" ;;
+      *)  host="$arg" ;;
+    esac
+  done
+  [ -n "$host" ] || host="$(env_get OWUI_REMOTE)"
+  [ -n "$host" ] || die "no host given and OWUI_REMOTE is not set"
+  need_docker
+
+  local data_rel ws_rel t_local t_remote src_t dst_t
+  data_rel="$(home_rel "$(data_dir)")"
+  t_local="$(db_mtime_local)"
+  t_remote="$(db_mtime_remote "$host" "$data_rel")" || die "cannot read database time on $host"
+
+  if [ "$dir" = "push" ]; then src_t="$t_local"; dst_t="$t_remote"
+  else src_t="$t_remote"; dst_t="$t_local"; fi
+
+  echo "  $dir with $host"
+  echo "  source db:      $(fmt_time "$src_t")"
+  echo "  destination db: $(fmt_time "$dst_t")"
+  [ -n "$with_ws" ] && echo "  including workspace: $(workspace_dir)"
+  [ "$src_t" = "0" ] && die "source has no webui.db; refusing to sync an empty folder over the destination"
+
+  if [ -z "$dry" ]; then
+    [ "$dst_t" -gt "$src_t" ] && echo "  WARNING: the destination database is NEWER than the source. Its changes will be lost."
+    confirm "Proceed?" || die "aborted"
+    if [ "$dir" = "push" ]; then stop_local; stop_remote "$host"
+    else stop_remote "$host"; stop_local; fi
+  fi
+
+  sync_one "$dir" "$host" "$(data_dir)" "$data_rel" "$dry" --exclude 'cache/'
+  if [ -n "$with_ws" ]; then
+    ws_rel="$(home_rel "$(workspace_dir)")"
+    sync_one "$dir" "$host" "$(workspace_dir)" "$ws_rel" "$dry"
+  fi
+  [ -n "$dry" ] && { info "dry run only, nothing changed"; return 0; }
+
+  if [ "$dir" = "push" ]; then
+    local state
+    state="$(ssh "$host" "$REMOTE_ENV; for c in $CONTAINERS; do docker start \$c >/dev/null 2>&1; done; docker inspect -f '{{.State.Running}}' open-webui 2>/dev/null || true")"
+    if [ "$state" = "true" ]; then
+      info "started on $host; local containers left stopped"
+    else
+      info "no stack on $host yet: on that machine, clone this repo and run 'owui setup'"
+    fi
+  else
+    cmd_up
+  fi
+}
+
+# sync_one <push|pull> host local_path remote_rel dry [extra rsync args...]
+sync_one() {
+  local dir="$1" host="$2" lpath="$3" rrel="$4" dry="$5"; shift 5
+  mkdir -p "$lpath"
+  ssh "$host" "mkdir -p '$rrel'"
+  if [ "$dir" = "push" ]; then
+    rsync -a $dry --delete --itemize-changes "$@" "$lpath/" "$host:$rrel/"
+  else
+    rsync -a $dry --delete --itemize-changes "$@" "$host:$rrel/" "$lpath/"
+  fi
+}
+
+# ---------- main ----------
+
+cmd="${1:-}"
+[ $# -gt 0 ] && shift
+case "$cmd" in
+  setup)        cmd_setup ;;
+  up)           cmd_up ;;
+  down)         cmd_down ;;
+  start)        cmd_start ;;
+  stop)         cmd_stop ;;
+  status)       cmd_status ;;
+  logs)         cmd_logs "$@" ;;
+  upgrade)      cmd_upgrade ;;
+  terminal-key) cmd_terminal_key ;;
+  push)         cmd_sync push "$@" ;;
+  pull)         cmd_sync pull "$@" ;;
+  ""|-h|--help|help) sed -n '2,16p' "$0" | sed 's/^# \{0,1\}//' ;;
+  *) die "unknown command '$cmd' (try 'owui help')" ;;
+esac

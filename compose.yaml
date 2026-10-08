@@ -1,0 +1,46 @@
+# Open WebUI connected to NCSA Lumen, with an optional Open Terminal workspace.
+#
+# Settings come from your shell environment first, then from .env in this folder.
+# Open Terminal only starts when COMPOSE_PROFILES includes "terminal".
+
+name: lumen-openwebui
+
+services:
+  open-webui:
+    image: ghcr.io/open-webui/open-webui:${OWUI_TAG:-main}
+    container_name: open-webui
+    restart: unless-stopped
+    ports:
+      # Bound to localhost only: not reachable from other machines on your network.
+      - "127.0.0.1:${OWUI_PORT:-3000}:8080"
+    environment:
+      OPENAI_API_BASE_URL: ${LUMEN_URL:-https://lumen.ncsa.illinois.edu/v1}
+      OPENAI_API_KEY: ${LUMEN_API_KEY:?LUMEN_API_KEY is not set (shell or .env)}
+      WEBUI_SECRET_KEY: ${WEBUI_SECRET_KEY:?WEBUI_SECRET_KEY is not set (run bin/owui setup)}
+      ENABLE_OLLAMA_API: "False"
+      # False = single-user mode, no login. Only takes effect on a fresh data folder.
+      WEBUI_AUTH: ${WEBUI_AUTH:-False}
+    volumes:
+      - ${OWUI_DATA:-${HOME}/openwebui-data}:/app/backend/data
+
+  open-terminal:
+    image: ghcr.io/open-webui/open-terminal:${TERMINAL_TAG:-latest}
+    container_name: open-terminal
+    profiles: ["terminal"]
+    restart: unless-stopped
+    # No ports published: only Open WebUI can reach it, at http://open-terminal:8000
+    environment:
+      OPEN_TERMINAL_API_KEY: ${OPEN_TERMINAL_API_KEY:-}
+    volumes:
+      # The container's home: installed packages and scratch files persist here.
+      - open-terminal-home:/home/user
+      # The only folder from your computer the AI can see and change.
+      - ${OWUI_WORKSPACE:-${HOME}/owui-workspace}:/home/user/workspace
+    deploy:
+      resources:
+        limits:
+          memory: ${TERMINAL_MEMORY:-4G}
+          cpus: "${TERMINAL_CPUS:-2.0}"
+
+volumes:
+  open-terminal-home:
