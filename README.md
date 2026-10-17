@@ -150,9 +150,11 @@ owui project rm Report     # remove the terminal; the folder is not touched
 
 Each project terminal has its own installed packages and its own memory limit
 (`TERMINAL_MEMORY`, 4G by default), so keep the number reasonable. Projects are
-stored in `projects.conf` and `compose.override.yaml` in this folder. Both are
-specific to your computer and not committed. `owui up`, `down`, and `status` include
-the project terminals automatically.
+stored in `projects.conf` in this folder, with folders relative to your home folder.
+`compose.override.yaml` is generated from it. Neither is committed. `owui up` brings
+the project terminals in line with `projects.conf`: it creates missing ones and
+removes containers of projects no longer listed. `owui down` and `status` include
+them too.
 
 A lighter option, if you only want to keep work organized: create a chat folder in
 Open WebUI, and in the folder's settings set a system prompt such as "Work only in
@@ -176,6 +178,11 @@ owui push other-host -n     # dry run: shows what would change
 owui push other-host        # stops both sides, syncs, starts the other side
 owui pull other-host -w     # pull, including the workspace folder
 ```
+
+Push and pull also copy your project list (`projects.conf`). With `-w` they copy
+project folders outside `~/owui-workspace` too. After a push, run `owui up` on the
+other machine once if it reports project terminals that are not there yet. A pull
+does this for you.
 
 Set `OWUI_REMOTE` in `.env` to skip typing the host. The script refuses to sync from an
 empty folder and warns if the destination is newer than the source. Use one machine at

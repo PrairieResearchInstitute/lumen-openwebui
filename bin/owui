@@ -120,16 +120,20 @@ cmd_setup() {
   info "pulling images"
   compose pull
   cmd_up
-  if terminal_enabled; then
-    cmd_connect_terminal || info "could not connect the terminal automatically; run 'owui connect-terminal' to retry"
-  fi
 }
 
 cmd_up() {
   need_docker
   mkdir -p "$(data_dir)"
-  terminal_enabled && mkdir -p "$(workspace_dir)"
+  if terminal_enabled; then
+    mkdir -p "$(workspace_dir)"
+    project_reconcile
+  fi
   compose up -d
+  if terminal_enabled; then
+    # Subshell: a failure here should not stop 'up' itself.
+    ( cmd_connect_terminal ) || info "could not register the terminals; run 'owui connect-terminal' to retry"
+  fi
   info "Open http://localhost:$(port) once 'owui status' shows (healthy)"
 }
 
@@ -230,10 +234,62 @@ cmd_connect_terminal() {
 
 project_slug() { printf '%s' "$1" | tr 'A-Z_' 'a-z-'; }
 
-# Path of project NAME, empty if there is none
+# projects.conf stores folders relative to the home folder, so the same file works
+# on every machine. Older entries with absolute paths still work.
+project_abs() {
+  case "$1" in
+    /*) printf '%s' "$1" ;;
+    *)  printf '%s/%s' "$HOME" "$1" ;;
+  esac
+}
+
+# Print FILE with folders under this machine's home made relative (older entries).
+projects_relative() {
+  awk -F'\t' -v OFS='\t' -v h="$HOME/" 'index($2, h) == 1 { $2 = substr($2, length(h) + 1) } { print }' "$1"
+}
+
+# Absolute folder of project NAME, empty if there is none
 project_path() {
-  [ -f "$PROJECTS_FILE" ] || return 0
-  awk -F'\t' -v n="$1" '$1 == n { print $2; exit }' "$PROJECTS_FILE"
+  local p=""
+  if [ -f "$PROJECTS_FILE" ]; then
+    p="$(awk -F'\t' -v n="$1" '$1 == n { print $2; exit }' "$PROJECTS_FILE")"
+  fi
+  if [ -n "$p" ]; then project_abs "$p"; fi
+  return 0
+}
+
+# Is NAME's slug used by a project in FILE? (default projects.conf)
+project_listed_slug() {
+  local slug="$1" file="${2:-$PROJECTS_FILE}" n p
+  [ -s "$file" ] || return 1
+  while IFS="$TAB" read -r n p; do
+    if [ -n "$n" ] && [ "$(project_slug "$n")" = "$slug" ]; then return 0; fi
+  done < "$file"
+  return 1
+}
+
+# Make the project terminals match projects.conf: regenerate the compose override,
+# create missing folders, and remove containers of projects that are no longer
+# listed (for example after a pull). Their package volumes are kept.
+project_reconcile() {
+  local name path c tmp
+  if [ -s "$PROJECTS_FILE" ]; then
+    tmp="$(mktemp)"
+    projects_relative "$PROJECTS_FILE" > "$tmp" && mv "$tmp" "$PROJECTS_FILE"
+  fi
+  write_override
+  if [ -s "$PROJECTS_FILE" ]; then
+    while IFS="$TAB" read -r name path; do
+      if [ -n "$name" ]; then mkdir -p "$(project_abs "$path")"; fi
+    done < "$PROJECTS_FILE"
+  fi
+  for c in $(docker ps -a --filter "label=com.docker.compose.project=lumen-openwebui" --format '{{.Names}}'); do
+    case "$c" in open-terminal-*) ;; *) continue ;; esac
+    if ! project_listed_slug "${c#open-terminal-}"; then
+      info "removing $c: its project is not in projects.conf (packages volume kept)"
+      docker rm -f "$c" >/dev/null
+    fi
+  done
 }
 
 # Write compose.override.yaml from projects.conf. Docker Compose reads that file
@@ -253,6 +309,11 @@ write_override() {
     while IFS="$TAB" read -r name path; do
       [ -n "$name" ] || continue
       slug="$(project_slug "$name")"
+      path="$(project_abs "$path")"
+      case "$path" in
+        "$HOME"/*) ;;
+        *) echo "owui: skipping project '$name': $path is not in your home folder" >&2; continue ;;
+      esac
       rel="${path#"$HOME"/}"
       cat <<EOF
   terminal-$slug:
@@ -309,7 +370,7 @@ project_add() {
     *) die "$path is not inside your home folder" ;;
   esac
 
-  printf '%s\t%s\n' "$name" "$path" >> "$PROJECTS_FILE"
+  printf '%s\t%s\n' "$name" "${path#"$HOME"/}" >> "$PROJECTS_FILE"
   write_override
   info "starting terminal-$slug (sees only $path)"
   compose up -d "terminal-$slug"
@@ -350,7 +411,7 @@ project_list() {
   while IFS="$TAB" read -r name path; do
     [ -n "$name" ] || continue
     if is_running "open-terminal-$(project_slug "$name")"; then state="running"; else state="stopped"; fi
-    printf '%-20s %-8s %s\n' "$name" "$state" "$path"
+    printf '%-20s %-8s %s\n' "$name" "$state" "$(project_abs "$path")"
   done < "$PROJECTS_FILE"
 }
 
@@ -465,13 +526,59 @@ cmd_sync() {
     ws_rel="$(home_rel "$(workspace_dir)")"
     sync_one "$dir" "$host" "$(workspace_dir)" "$ws_rel" "$dry"
   fi
+
+  # Projects: the destination gets the source's projects.conf. With -w, project
+  # folders outside the workspace are synced too (those inside already were).
+  local repo_rel conf pname ppath pabs proj_containers=""
+  repo_rel="$(home_rel "$REPO_DIR")"
+  conf="$(mktemp)"
+  if [ "$dir" = "push" ]; then
+    if [ -f "$PROJECTS_FILE" ]; then projects_relative "$PROJECTS_FILE" > "$conf"; fi
+  else
+    # Make the remote's paths relative to ITS home folder before copying.
+    ssh "$host" "f='$repo_rel/projects.conf'; [ -f \"\$f\" ] && awk -F'\t' -v OFS='\t' -v h=\"\$HOME/\" 'index(\$2, h) == 1 { \$2 = substr(\$2, length(h) + 1) } { print }' \"\$f\" || true" > "$conf"
+  fi
+  if [ -s "$conf" ]; then
+    echo "  projects: $(cut -f1 "$conf" | tr '\n' ' ')"
+    while IFS="$TAB" read -r pname ppath; do
+      [ -n "$pname" ] || continue
+      proj_containers="$proj_containers open-terminal-$(project_slug "$pname")"
+      [ -n "$with_ws" ] || continue
+      pabs="$(project_abs "$ppath")"
+      case "$pabs/" in "$(workspace_dir)"/*) continue ;; esac
+      sync_one "$dir" "$host" "$pabs" "$(home_rel "$pabs")" "$dry"
+    done < "$conf"
+  else
+    echo "  projects: none"
+  fi
+  if [ -z "$dry" ]; then
+    if [ "$dir" = "push" ]; then
+      if ! ssh "$host" "[ -d '$repo_rel' ]"; then
+        info "no repo at ~/$repo_rel on $host; projects not copied"
+      elif [ -s "$conf" ]; then
+        rsync -a "$conf" "$host:$repo_rel/projects.conf"
+      else
+        ssh "$host" "rm -f '$repo_rel/projects.conf'"
+      fi
+    else
+      if [ -s "$conf" ]; then cp "$conf" "$PROJECTS_FILE"; else rm -f "$PROJECTS_FILE"; fi
+    fi
+  fi
+  rm -f "$conf"
+
   [ -n "$dry" ] && { info "dry run only, nothing changed"; return 0; }
 
   if [ "$dir" = "push" ]; then
-    local state
-    state="$(ssh "$host" "$REMOTE_ENV; for c in $CONTAINERS; do docker start \$c >/dev/null 2>&1; done; docker inspect -f '{{.State.Running}}' open-webui 2>/dev/null || true")"
+    local out state missing
+    out="$(ssh "$host" "$REMOTE_ENV; for c in $CONTAINERS$proj_containers; do docker start \$c >/dev/null 2>&1 || echo missing:\$c; done; docker inspect -f '{{.State.Running}}' open-webui 2>/dev/null || true")"
+    state="$(printf '%s\n' "$out" | tail -n 1)"
+    missing="$(printf '%s\n' "$out" | sed -n 's/^missing:\(open-terminal-.*\)/\1/p' | tr '\n' ' ')"
     if [ "$state" = "true" ]; then
       info "started on $host; local containers left stopped"
+      if [ -n "$missing" ]; then
+        info "project terminals not yet on $host: $missing"
+        info "on $host, run 'owui up' to create them"
+      fi
     else
       info "no stack on $host yet: on that machine, clone this repo and run 'owui setup'"
     fi
